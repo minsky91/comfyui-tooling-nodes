@@ -12,6 +12,124 @@ from server import PromptServer, BinaryEventTypes
 from comfy.clip_vision import ClipVisionModel
 from comfy.sd import StyleModel
 
+# minsky91
+import folder_paths
+from nodes import SaveImage
+import aiohttp
+from aiohttp import web
+import logging
+import time
+from time import gmtime, strftime, sleep
+from io import BytesIO
+from datetime import datetime
+from sys import getsizeof
+import os
+from pathlib import Path
+
+EXPIRED_IMAGE_TIMEOUT = 300 
+WAIT_FOR_IMAGE_TIMEOUT = 15 
+SEND_RECEIVE_IMAGES = None
+
+def get_time_diff(start_time: datetime = None):
+    if datetime is None:
+        return 0, ""
+    time_now = datetime.now()
+    time_diff: float = (time_now - start_time).microseconds / 10.0**6
+    time_diff = time_diff + (time_now - start_time).seconds
+    return time_diff,  f"time {time_diff:.1f} sec."
+
+def set_shared_transient_image_storage(storage):
+    global SEND_RECEIVE_IMAGES
+    SEND_RECEIVE_IMAGES = storage
+
+def transient_storage_node_error_message(node_class_id: str, err_msg: str, uid: str):
+    logging.info("{} {} node ERROR for image: {}, uid {}".format(time.strftime('%T '), node_class_id,  err_msg, uid))
+
+
+class TransientImage(NamedTuple):
+    storage_timestamp: datetime 
+    images: list[Image]
+    
+class SendReceiveImages:
+    def __init__(self, server: server.PromptServer):
+        self._server = server
+        self._trans_images: dict[str, TransientImage] = {}
+
+    def store_singular_image(self, image_uid: str, image: Image, do_append: bool):
+        if do_append:
+            try:
+                self._trans_images[image_uid].images.append(image) 
+                if self._trans_images[image_uid].storage_timestamp is None:
+                    self._trans_images[image_uid].storage_timestamp = datetime.now()
+                return
+            except KeyError:
+                pass
+        self._trans_images[image_uid] = TransientImage(storage_timestamp=datetime.now(), images=[image])
+        
+    def retrieve_singular_image(self, image_uid: str = "", im_ix: int = 1, do_wait: bool = False):
+        start_time = datetime.now()
+        waited_time = 0.0
+        while im_ix > 0 and waited_time < WAIT_FOR_IMAGE_TIMEOUT:
+            if image_uid in self._trans_images: 
+                if im_ix <= len(self._trans_images[image_uid].images):
+                    return self._trans_images[image_uid].images[im_ix-1]
+            if not do_wait:
+                return None
+            sleep(0.1)
+            waited_time, _ = get_time_diff(start_time) 
+            
+        return None
+
+    def remove_image(self, image_uid: str):
+        try:
+            del self._trans_images[image_uid]
+            return self._trans_images
+        except KeyError:
+            pass
+        return None
+    
+    def pop_trans_images(self, image_uid: str):
+        try:
+            transient_image = self._trans_images.pop(image_uid)
+            return transient_image.images
+        except KeyError:
+            pass
+        return None
+                
+    def total_trans_images(self, image_uid: str):
+        try:
+            n_images = len(self._trans_images[image_uid].images)
+        except KeyError:
+            n_images = -1
+        return n_images, len(self._trans_images)
+    
+    def purge_expired_images(self):
+        deleted_images = 0
+        for uid, t_img in self._trans_images.items():
+            if (datetime.now() - t_img.storage_timestamp).seconds > EXPIRED_IMAGE_TIMEOUT:
+                del self._trans_images[uid]
+                deleted_images = deleted_images + 1
+        return deleted_images
+
+    def reset_storage(self):
+        deleted_images = len(self._trans_images)
+        self._trans_images.clear()
+        #for key in self._trans_images.items():
+        #    self._trans_images.pop(key, None)
+        #    del self._trans_images[key]
+        return deleted_images
+
+    def get_last_elapsed_time(self):
+        this_datetime = datetime.now()
+        last_stored_elapsed_time:float = 10**8 
+        for uid, t_img in self._trans_images.items():
+            if (this_datetime - t_img.storage_timestamp).seconds < last_stored_elapsed_time:
+                last_stored_elapsed_time = (this_datetime - t_img.storage_timestamp).seconds
+        return last_stored_elapsed_time
+
+        
+# end of minsky91 additions
+
 
 class LoadImageBase64:
     @classmethod
@@ -267,6 +385,211 @@ class ApplyReferenceImages:
 
         return (result,)
 
+# minsky91: added nodes to support hires image transfer to and from the client
+
+class SendImagesTransient:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "format": (["PNG", "JPEG"], {"default": "PNG"}),
+                "uid": ("STRING", {"multiline": False})
+            }
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "send_images_transient"
+    OUTPUT_NODE = True
+    DESCRIPTION = "Sends an image to a transient storage, to be retiived by the client using http protocol (aiohttp/web). Intended for use by frontends as a replacement for slow websockets transfer."
+    CATEGORY = "external_tooling"
+
+    def send_images_transient(self, images, format, uid: str):
+        results = []
+        image_format = format.lower()
+        if uid == "":
+            uid = f"testuid_{datetime.now()}" 
+        if SEND_RECEIVE_IMAGES is None:
+            transient_storage_node_error_message("SendImageHttp", "SEND_RECEIVE_IMAGES storage is None, no images returned", uid)
+            return None
+        image_size: int = 0 
+        image_uncompr_size: int = 0 
+        time = datetime.now()
+        for tensor in images:
+            array = 255.0 * tensor.cpu().numpy()
+            image_uncompr_size = image_uncompr_size + array.nbytes
+            image = Image.fromarray(np.clip(array, 0, 255).astype(np.uint8))
+            image_size = image_size + image.size[0]*image.size[1]*3 
+            SEND_RECEIVE_IMAGES.store_singular_image(image_uid=uid, image=image, do_append=True)
+            results.append({
+                "source": "http",
+                "content-type": f"image/{image_format}",
+                "type": "output",
+            })
+        img_mb_size: float = image_size / 1024.0**2
+        image_uncompr_mb_size: float = image_uncompr_size / 1024.0**2
+        _, time_str = get_time_diff(time) 
+        logging.info(
+            "{} SendImageHttp node: notifying client to download {} output image(s) of total {:.2f} MB size (from {:.2f} MB uncompr), {}, uid {}".format(
+                datetime.now().strftime('%T '), 
+                len(images), 
+                img_mb_size, 
+                image_uncompr_mb_size, 
+                time_str, 
+                uid
+            )
+        )
+        image_data = {"format": format, "n_images": len(images), "uid": uid}
+        server = PromptServer.instance
+        server.send_sync("sending_images", image_data, server.client_id)
+        return {"ui": {"images": results}}
+
+class SaveTempImage(SaveImage):
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+        self.compress_level = 2
+        self.prefix_append = ""
+        
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "filename_prefix": ("STRING", {"default": "ComfyUI", "tooltip": "The prefix for the file to save, to uniquely identify the temporary file. May include a subfolder name."}),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO"
+            },
+        }
+
+    CATEGORY = "external_tooling"
+    DESCRIPTION = "Saves an image with a given filename prefix to the temp folder, for a later retrieval by the client. Intended for use by frontends as a replacement for slow websockets transfer)."
+    FUNCTION = "save_temp_image"
+
+    def save_temp_image(self, images, filename_prefix, prompt=None, extra_pnginfo=None):
+        time = datetime.now()
+        result = self.save_images(images, filename_prefix, None, None)['ui']['images']
+        _, time_str = get_time_diff(time) 
+        array = 255.0 * images[0].cpu().numpy()
+        image_0 = Image.fromarray(np.clip(array, 0, 255).astype(np.uint8))
+        logging.info(
+            "{} SaveTempImage node: notifying client to download {} temp {}x{} image(s) in PNG format, compr_level {}, save {}, prefix {}".format(
+	        datetime.now().strftime('%T '), 
+	        len(images), 
+	        image_0.width,
+	        image_0.height,
+	        self.compress_level,
+	        time_str,
+	        filename_prefix 
+	    )
+        )
+        server = PromptServer.instance
+        image_data = {"prefix": filename_prefix, "n_images": len(images)}
+        server.send_sync("images_ready", image_data, server.client_id)
+        return result
+
+class LoadImageTransient:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"uid": ("STRING", {"multiline": False})}}
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    DESCRIPTION = "Retreives an image from a transient storage uploaded by the client using http protocol (aiohttp/web). Intended for use by frontends as a replacement for the high-overhead LoadImageBase64 node."
+    CATEGORY = "external_tooling"
+    FUNCTION = "load_image_transient"
+
+    def load_image_transient(self, uid: str):
+        time = datetime.now()
+        if SEND_RECEIVE_IMAGES is None:
+            transient_storage_node_error_message("LoadImageTransient", "SEND_RECEIVE_IMAGES storage is None, no images loaded", uid)
+            return None, None
+        image = SEND_RECEIVE_IMAGES.retrieve_singular_image(uid, 1, True)
+        if image is None:
+            _, time_str = get_time_diff(time) 
+            msg_str = "no images with this uid or index too large, inquiry {}".format(time_str)
+            transient_storage_node_error_message("LoadImageTransient", msg_str, uid)
+            return None, None
+
+        # the image in the transient memory is expected to be already decoded (but not decompressed)
+        body = BytesIO(memoryview(image))
+        initial_img_mb_size: float = getsizeof(body) / 1024.0**2
+        img = Image.open(body)
+
+        if "A" in img.getbands():
+            mask = np.array(img.getchannel("A")).astype(np.float32) / 255.0
+            mask = 1.0 - torch.from_numpy(mask)
+        else:
+            mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
+
+        img = img.convert("RGB")
+        img = np.array(img).astype(np.float32) / 255.0
+        img = torch.from_numpy(img)[None,]
+
+        img_mb_size: float = img.nbytes / 1024.0**2
+        _, time_str = get_time_diff(time) 
+        logging.info(
+            "{} LoadImageTransient node: retrieved image of {:.2f} MB size, {}, returning {:.2f} MB uncompr, uid {}".format(
+                datetime.now().strftime('%T '), 
+                initial_img_mb_size, 
+                time_str, 
+                img_mb_size, 
+                uid
+            )
+        )
+
+        return (img, mask)
+        
+class LoadMaskTransient:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"uid": ("STRING", {"multiline": False})}}
+
+    RETURN_TYPES = ("MASK",)
+    DESCRIPTION = "Retreives a maks image from a transient storage uploaded by the client using http protocol (aiohttp/web). Intended for use by frontends as a replacement for the high-overhead LoadImageBase64 node."
+    CATEGORY = "external_tooling"
+    FUNCTION = "load_mask_transient"
+
+    def load_mask_transient(self, uid):
+        time = datetime.now()
+        if SEND_RECEIVE_IMAGES is None:
+            transient_storage_node_error_message("LoadMaskTransient", "SEND_RECEIVE_IMAGES storage is None, no mask images loaded", uid)
+            return None, None
+        image = SEND_RECEIVE_IMAGES.retrieve_singular_image(uid, 1)
+        if image is None:
+            _, time_str = get_time_diff(time) 
+            msg_str = "no images with this uid or index too large, inquiry {}".format(time_str)
+            transient_storage_node_error_message("LoadMaskTransient", msg_str, uid)
+            return None, None
+
+        # the mask image in the transient memory is expected to be already decoded (but not decompressed)
+        body = BytesIO(memoryview(image))
+        initial_img_mb_size: float = getsizeof(body) / 1024.0**2
+        img = Image.open(body)
+
+        img = np.array(img).astype(np.float32) / 255.0
+        img = torch.from_numpy(img)
+        if img.dim() == 3:  # RGB(A) input, use red channel
+            img = img[:, :, 0]
+        img_mb_size: float = img.nbytes / 1024.0**2
+        img = img.unsqueeze(0),
+
+        _, time_str = get_time_diff(time) 
+        logging.info(
+            "{} LoadMaskTransient node: retrieved mask image of {:.2f} MB size, {}, returning {:.2f} MB uncompr, uid {}".format(
+                datetime.now().strftime('%T '), 
+                initial_img_mb_size, 
+                time_str, 
+                img_mb_size, 
+                uid
+            )
+        )
+
+        return (img)        
+
+# end of minsky91 additions
+        
 
 def _encode_image(
     image: torch.Tensor, clip_vision: ClipVisionModel, style_model: StyleModel, weight: float
@@ -301,7 +624,7 @@ def _downsample_image_cond(cond: torch.Tensor, weight: float):
     )
     return cond.transpose(1, -1).reshape(b, -1, h)
 
-
+    
 def _strip_prefix(s: str, prefix: str) -> str:
     if s.startswith(prefix):
         return s[len(prefix) :]

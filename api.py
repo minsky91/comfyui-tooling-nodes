@@ -15,6 +15,15 @@ import server
 from .translation import available_languages, translate
 from .krita import WorkflowExchange
 
+# minsky91
+from .nodes import get_time_diff, TransientImage, SendReceiveImages, set_shared_transient_image_storage
+from time import gmtime, strftime
+from datetime import datetime
+from io import BytesIO
+import base64
+from base64 import a85decode, b85decode
+#from base64 import z85decode  # supported from v3.13 on
+
 input_block_name = "model.diffusion_model.input_blocks.0.0.weight"
 
 model_names = {
@@ -182,6 +191,169 @@ _server: server.PromptServer | None = getattr(server.PromptServer, "instance", N
 if _server is not None:
     _workflow_exchange = WorkflowExchange(_server)
 
+    # minsky91
+    _send_receive_images = SendReceiveImages(_server)
+    set_shared_transient_image_storage(_send_receive_images)
+    
+    
+    @_server.routes.put("/api/etn/transient_image/upload/{image_uid}/{reset_storage}")
+    async def input_image_upload(request: web.Request):
+        return await _handle_image_upload(request=request, is_post=False)
+    
+    @_server.routes.post("/api/etn/transient_image/post/{image_uid}/{reset_storage}")
+    async def input_image_post(request: web.Request):
+        try:
+            data = await request.json()
+        except KeyError as e:
+            return web.json_response(dict(error=str(e)), status=400)
+        except Exception as e:
+            return web.json_response(dict(error=str(e)), status=500)
+        return await _handle_image_upload(request=request, is_post=True, json_data=data)
+    
+    async def _handle_image_upload(request: web.Request, is_post: bool = False, json_data=None):
+        time = datetime.now()
+        enc_str = ""
+        image_uid = request.match_info.get("image_uid", "")
+        reset_storage = request.match_info.get("reset_storage", "no")
+        if image_uid == "":
+            logging.info(f"{strftime('%T ')} etn_routes: ERROR input image upload request with empty uid")
+            return web.json_response(
+                dict(error= f"Input image {kind_str}: ERROR received empty image uid, image ignored"),
+                status=400,
+            )
+        if is_post:
+            kind_str = "post"
+            upload_size = 0
+            if "image_data" in json_data:
+                image_bytes = json_data["image_data"]
+                upload_size = len(image_bytes)
+            if upload_size == 0:
+                return web.json_response(
+                    dict(error=f"Input image {kind_str}: WARNING received empty image content, post ignored"), status=400,
+                )
+            enc_kind = json_data["encode"] if "encode" in json_data else "base64"
+            enc_str = f"{enc_kind}-encoded "
+        else:
+            kind_str = "upload"
+            upload_size = int(request.headers.get("Content-Length", "0"))
+        if "no" in reset_storage.lower() or "n" in reset_storage.lower():
+            do_reset_storage = False
+        else:
+            do_reset_storage = True
+        upload_size_mb = upload_size / 1024.0**2
+        logging.info(
+            f"{strftime('%T ')} etn_routes: input image {kind_str} request for uid {image_uid}, {enc_str}{upload_size_mb:.2f} MB size, reset_storage {do_reset_storage}"
+        )
+        deleted_str = ""
+        if do_reset_storage:
+            deleted_images = _send_receive_images.reset_storage()
+            if deleted_images > 0:
+                deleted_str = f", released {deleted_images} image(s)"
+        try:
+            bytesIO = BytesIO()
+            if is_post:
+                # decode image data based on the client-specified encoding type
+                if enc_kind == "Base64":
+                    bytes_decoded = base64.b64decode(image_bytes)
+                elif enc_kind == "a85":
+                    bytes_decoded = a85decode(image_bytes)
+                elif enc_kind == "b85":
+                    bytes_decoded = b85decode(image_bytes)
+                #elif enc_kind == "z85":
+                #    bytes_decoded = z85decode(image_bytes)  # supported from v3.13 on
+                else:
+                    raise TypeError(
+                        f"Unsupported type of binary_to_text encoding {enc_kind}"
+                    )
+                bytesIO.write(bytes_decoded)
+            else: # regular upload via put
+                async for chunk, _ in request.content.iter_chunks():
+                    bytesIO.write(chunk)
+        except Exception as e:
+            return web.json_response(dict(error=str(e)), status=500)
+
+        bytesIO.seek(0)
+        image = bytesIO.read()
+        img_mb_size = len(image) / 1024.0**2
+        _send_receive_images.store_singular_image(image_uid=image_uid, image=image, do_append=False)
+        #fullfilename = f"D:\\Download\\received_image.png"
+        #with open(fullfilename, "wb") as f:
+        #    f.write(image)
+        #    f.close()
+        _, time_str = get_time_diff(time) 
+        logging.info(
+            f"{strftime('%T ')} etn_routes: stored {kind_str}ed input image of {img_mb_size:.2f} MB size with uid {image_uid} to transient storage, upload {time_str}{deleted_str}"
+        )
+        return web.json_response(dict(status="success"), status=200)
+
+    @_server.routes.get("/api/etn/transient_image/download/{image_uid}/{image_index}/{format}")
+    async def output_image_download(request: web.Request):
+        time = datetime.now()
+        image_uid = request.match_info.get("image_uid", "")
+        if image_uid == "":
+            logging.info(f"{strftime('%T ')} etn_routes: WARNING output image download request with empty uid ignored")
+            return web.json_response(
+                dict(error="Output image download: received empty image uid"),
+                status=400,
+            )
+        image_ix = int(request.match_info.get("image_index", "1"))
+        image_format = request.match_info.get("format", ".PNG").lower()
+        total_uid_images, total_images = _send_receive_images.total_trans_images(image_uid)
+        istr = f" and index {image_ix} / {total_uid_images}"
+        tstr = f"{total_images} total images in the storage"
+        logging.info(
+            f"{strftime('%T ')} etn_routes: output request to download a {image_format} image with uid {image_uid}{istr}; {tstr}"
+        )
+        if total_uid_images > 0 and image_ix <= total_uid_images:
+            image: Image = _send_receive_images.retrieve_singular_image(image_uid, image_ix, False)
+            if image:
+                buffer = BytesIO()
+                compr_str = "png compr level 2"
+                if image_format =='jpeg':
+                    image = image.convert("RGB")
+                    compr_str = "jpeg quality 95"
+                image.save(buffer, format=image_format, compress_level=2, quality=95)
+                _, time_str = get_time_diff(time) 
+                buffer.seek(0)
+                body = buffer.read()
+                img_mb_size: float = len(body) / 1024.0**2
+                size_str = f"{img_mb_size:.1f} MB"
+                if image_ix == total_uid_images:
+                    # images are always stored and retrieved in a sequence, we can safely remove the batch after retrieving the last one
+                    _send_receive_images.remove_image(image_uid)
+                resp = web.Response(body=body, content_type=f'image/{image_format}', headers={"Content-Disposition": "attachment"})
+                if resp is not None:
+                    _, time_str = get_time_diff(time) 
+                    #_send_receive_images.purge_expired_images()
+                    logging.info(
+                       f"{strftime('%T ')} etn_routes: sent a {image.width}x{image.height} image of {size_str} for download, {compr_str}, prep {time_str}"
+                    )
+                    return resp
+
+        _, time_str = get_time_diff(time) 
+        error_str = f"etn_routes: ERROR no images with this uid, index too large or a network error, wait {time_str}"
+        logging.error(f"{strftime('%T ')} {error_str}")
+        return web.json_response(dict(error=error_str), status=500)
+
+    @_server.routes.get("/api/etn/transient_image/reset_storage")
+    async def reset_storage(request: web.Request):
+        last_stored_elapsed_time = _send_receive_images.get_last_elapsed_time()
+        if last_stored_elapsed_time <= 10.0:
+            # there are too recently stored images, avoid resetting
+            released_images = 0
+        else:
+            released_images = _send_receive_images.reset_storage()
+        logging.info(
+            f"{strftime('%T ')} etn_routes: reset transient storage request, {released_images} image(s) released"
+        )
+        try:
+            result = {"released images" : released_images}
+            return web.json_response(result)
+        except Exception as e:
+            return web.json_response(dict(error=str(e)), status=500)
+        
+    # end of minsky91 additions
+    
     @_server.routes.get("/api/etn/model_info/{folder_name}")
     async def model_info(request: web.Request):
         folder_name = request.match_info.get("folder_name", "checkpoints")
@@ -231,7 +403,7 @@ if _server is not None:
             folder = Path(folder_paths.folder_names_and_paths[folder_name][0][0])
             total_size = int(request.headers.get("Content-Length", "0"))
             logging.info(
-                f"Uploading {filename} ({total_size / (1024**2):.1f} MB) to {folder} folder"
+                f"Uploading {filename} ({total_size / (1024**2):.2f} MB) to {folder} folder"
             )
 
             with open(folder / filename, "wb") as f:

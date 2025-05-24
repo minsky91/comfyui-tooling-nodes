@@ -4,6 +4,12 @@ NODE_CLASS_MAPPINGS = {
     "ETN_LoadImageBase64": nodes.LoadImageBase64,
     "ETN_LoadMaskBase64": nodes.LoadMaskBase64,
     "ETN_SendImageWebSocket": nodes.SendImageWebSocket,
+    # minsky91 
+    "ETN_SaveTempImage": nodes.SaveTempImage,
+    "ETN_SendImagesTransient": nodes.SendImagesTransient,
+    "ETN_LoadImageTransient": nodes.LoadImageTransient,
+    "ETN_LoadMaskTransient": nodes.LoadMaskTransient,
+    # end of minsky91 additions
     "ETN_CropImage": nodes.CropImage,
     "ETN_ApplyMaskToImage": nodes.ApplyMaskToImage,
     "ETN_ReferenceImage": nodes.ReferenceImage,
@@ -32,6 +38,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ETN_LoadImageBase64": "Load Image (Base64)",
     "ETN_LoadMaskBase64": "Load Mask (Base64)",
     "ETN_SendImageWebSocket": "Send Image (WebSocket)",
+    # minsky91 
+    "ETN_SaveTempImage": "Save Temp Image",
+    "ETN_SendImagesTransient": "Send Images (Transient)",
+    "ETN_LoadImageTransient": "Load Image (Transient)",
+    "ETN_LoadMaskTransient": "Load Mask (Transient)",
+    # end of minsky91 additions
     "ETN_CropImage": "Crop Image",
     "ETN_ApplyMaskToImage": "Apply Mask to Image",
     "ETN_ReferenceImage": "Reference Image",
